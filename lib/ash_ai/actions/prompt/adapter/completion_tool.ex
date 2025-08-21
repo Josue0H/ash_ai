@@ -36,14 +36,32 @@ defmodule AshAi.Actions.Prompt.Adapter.CompletionTool do
         """
       end
 
+    # Gemini can return MALFORMED_FUNCTION_CALL when schemas are overly strict.
+    # For GoogleAI, accept any object for `result` and validate on the server.
+    llm_mod_str = to_string(llm.__struct__)
+    result_schema_for_provider =
+      if String.ends_with?(llm_mod_str, "ChatGoogleAI") do
+        %{"type" => "object"}
+      else
+        data.json_schema
+      end
+
+    # Compute required list for parameters
+    required_keys_for_provider =
+      if String.ends_with?(llm_mod_str, "ChatGoogleAI") do
+        []
+      else
+        ["result"]
+      end
+
     completion_tool =
       LangChain.Function.new!(%{
         name: "complete_request",
         description: description,
         parameters_schema: %{
           "type" => "object",
-          "properties" => %{"result" => data.json_schema},
-          "required" => ["result"],
+          "properties" => %{"result" => result_schema_for_provider},
+          "required" => required_keys_for_provider,
           "additionalProperties" => false
         },
         strict: true,
@@ -80,14 +98,30 @@ defmodule AshAi.Actions.Prompt.Adapter.CompletionTool do
     }
     |> LLMChain.new!()
     |> AshAi.Actions.Prompt.Adapter.Helpers.add_messages_with_templates(messages, data)
-    |> LLMChain.add_tools([completion_tool | data.tools])
+    |> then(fn chain ->
+      # Sanitize tools if using Gemini
+      tools = [completion_tool | data.tools]
+      tools = AshAi.sanitize_tools_for_llm(tools, chain.llm)
+      LLMChain.add_tools(chain, tools)
+    end)
     |> LLMChain.run_until_tool_used("complete_request", max_runs: max_runs)
     |> case do
-      {:ok, _chain, message} ->
-        {:ok, message.processed_content}
+      # Normal success shape
+      {:ok, _chain, %{processed_content: content}} ->
+        {:ok, content}
 
+      # Some langchain versions may return the error wrapped in an :ok tuple with a keyword list
+      {:ok, [error: error]} ->
+        {:error, error}
+
+      # Pass-through error shape
       {:error, _chain, error} ->
         {:error, error}
+
+      # Fallback: surface an "unexpected_response" error without crashing the process
+      other ->
+        {:error,
+         %LangChain.LangChainError{type: "unexpected_response", message: "Unexpected response", original: other}}
     end
   end
 end

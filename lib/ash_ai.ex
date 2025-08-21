@@ -312,6 +312,15 @@ defmodule AshAi do
   def setup_ash_ai(lang_chain, opts) do
     tools = functions(opts)
 
+    # If using a Gemini LLM, strip unsupported JSON Schema keywords like
+    # "additionalProperties" from tool parameter schemas.
+    llm = case lang_chain do
+      %LangChain.Chains.LLMChain{llm: llm} -> llm
+      _ -> nil
+    end
+
+    tools = sanitize_tools_for_llm(tools, llm)
+
     lang_chain
     |> LLMChain.add_tools(tools)
     |> LLMChain.update_custom_context(%{
@@ -346,6 +355,88 @@ defmodule AshAi do
         raise "Something went wrong:\n #{Exception.format(:error, error)}"
     end
   end
+
+  # -- Provider-specific helpers -------------------------------------------------
+
+  @doc false
+  def sanitize_tools_for_llm(tools, llm) when is_list(tools) do
+    case llm_provider(llm) do
+      :google_ai -> Enum.map(tools, &sanitize_tool_for_google/1)
+      _ -> tools
+    end
+  end
+
+  defp llm_provider(nil), do: nil
+  defp llm_provider(%{__struct__: mod}) do
+    mod_str = to_string(mod)
+
+    cond do
+      String.ends_with?(mod_str, "ChatGoogleAI") -> :google_ai
+      String.ends_with?(mod_str, "ChatGoogleAIBeta") -> :google_ai
+      true -> nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  defp sanitize_tool_for_google(%LangChain.Function{name: "complete_request"} = fun) do
+    # For the completion tool, keep it permissive but include a 'result' object so the model can call it.
+    %{fun |
+      parameters_schema: %{
+        "type" => "object",
+        "properties" => %{
+          "result" => %{"type" => "object"}
+        }
+      },
+      strict: false
+    }
+  end
+
+  defp sanitize_tool_for_google(%LangChain.Function{} = fun) do
+    # For other tools, keep structure so the model sees the expected 'input' nesting,
+    # but strip Gemini-unsupported/fragile JSON Schema keywords.
+    base_schema = strip_schema_keys(fun.parameters_schema, [
+      "additionalProperties",
+      :additionalProperties,
+      "oneOf",
+      :oneOf,
+      "anyOf",
+      :anyOf,
+      "allOf",
+      :allOf,
+      "required",
+      :required
+    ])
+
+    schema =
+      case base_schema do
+        %{"properties" => %{"input" => %{"properties" => inner_props}}} ->
+          %{"type" => "object", "properties" => inner_props}
+
+        # handle atom keys as well
+        %{properties: %{input: %{properties: inner_props}}} ->
+          %{"type" => "object", "properties" => inner_props}
+
+        other ->
+          other
+      end
+
+    %{fun | parameters_schema: schema, strict: false}
+  end
+
+  defp strip_schema_keys(nil, _keys), do: nil
+  defp strip_schema_keys(map, keys) when is_map(map) do
+    map
+    |> then(fn m -> Enum.reduce(keys, m, fn k, acc -> Map.delete(acc, k) end) end)
+    |> Enum.map(fn {k, v} -> {k, strip_schema_keys(v, keys)} end)
+    |> Map.new()
+  end
+
+  defp strip_schema_keys(list, keys) when is_list(list) do
+    Enum.map(list, &strip_schema_keys(&1, keys))
+  end
+
+  defp strip_schema_keys(other, _keys), do: other
 
   defp get_user_message do
     case Mix.shell().prompt("> ") do
@@ -437,7 +528,11 @@ defmodule AshAi do
       function: fn arguments, context ->
         actor = context[:actor]
         tenant = context[:tenant]
-        input = arguments["input"] || %{}
+        input =
+          case arguments["input"] do
+            %{} = i -> i
+            _ -> derive_input_from_arguments(arguments, resource, action)
+          end
         opts = [domain: domain, actor: actor, tenant: tenant, context: context[:context] || %{}]
 
         callbacks = context[:tool_callbacks] || %{}
@@ -751,6 +846,32 @@ defmodule AshAi do
     end)
   end
 
+  # When a tool call omits the "input" wrapper and passes top-level keys,
+  # derive the input map by filtering only action public arguments and accepted attributes.
+  defp derive_input_from_arguments(arguments, resource, action) do
+    # Collect allowed input keys from public action arguments and accepted attributes
+    public_args =
+      action.arguments
+      |> Enum.filter(& &1.public?)
+      |> Enum.map(& &1.name)
+
+    accepted_attrs =
+      case action.type do
+        t when t in [:create, :update, :destroy] ->
+          (Map.get(action, :accept) || [])
+        _ ->
+          []
+      end
+
+    allowed = MapSet.new(public_args ++ accepted_attrs)
+
+    arguments
+    |> Enum.reduce(%{}, fn {k, v}, acc ->
+      atom_key = if is_binary(k), do: String.to_atom(k), else: k
+      if MapSet.member?(allowed, atom_key), do: Map.put(acc, atom_key, v), else: acc
+    end)
+  end
+
   def to_json_api_errors(domain, resource, errors, type) when is_list(errors) do
     Enum.flat_map(errors, &to_json_api_errors(domain, resource, &1, type))
   end
@@ -1052,7 +1173,6 @@ defmodule AshAi do
         input_for_fields =
           %{
             type: :object,
-            additonalProperties: false,
             properties:
               Map.new(fields, fn field ->
                 inputs =
@@ -1081,7 +1201,7 @@ defmodule AshAi do
                    type: :object,
                    properties: Map.new(inputs),
                    required: required,
-                   additionalProperties: false
+                    additionalProperties: false
                  }}
               end)
           }
